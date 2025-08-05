@@ -1,0 +1,14 @@
+# Arduino build files
+*.elf
+*.bin
+*.hex
+*.pyc
+*.o
+build/
+__pycache__/
+.DS_Store
+*.d
+*.dep
+*.bak
+*.orig
+
