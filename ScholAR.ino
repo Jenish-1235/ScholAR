@@ -34,6 +34,10 @@ bool wifiConnected = false;
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
+camera_fb_t* prevFrame = nullptr;
+unsigned long lastFrameCapture = 0;
+const unsigned long frameInterval = 2000; // 2 seconds time between frame captures
+const int changeThreshold = 500;
 
 
 
@@ -63,6 +67,24 @@ void loop(){
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState);
     lastBlink = currentMillis;
+  }
+
+  if(currentMillis - lastFrameCapture >= frameInterval){
+    camera_fb_t* current = captureFrame();
+    if(current){
+      bool changed = hasFrameChanged(current, prevFrame);
+      Serial.printf("Frame Changed: %s\n", changed ? "YES" : "NO");
+
+      if (prevFrame) {
+        free(prevFrame->buf);  // Free JPEG data
+        free(prevFrame);       // Free frame struct
+      }
+
+      prevFrame = cloneFrame(current); // Copy current frame
+
+      esp_camera_fb_return(current); 
+    }
+    lastFrameCapture = currentMillis;
   }
 }
 
@@ -131,3 +153,57 @@ bool setupCamera(){
 
 
 }
+
+camera_fb_t* captureFrame(){
+  camera_fb_t* fb = esp_camera_fb_get();
+  if(!fb){
+    Serial.println("Failed to capture frame.");
+  return nullptr;
+  }
+
+  Serial.printf("Captured : %dx%d | %u bytes\n", 
+  fb->width, fb->height, fb->len);
+  return fb;
+}
+
+bool hasFrameChanged(camera_fb_t* current, camera_fb_t* previous) {
+  if(!current || !previous) return true;
+  if(current->len != previous->len) return true;
+
+  int diffCount = 0;
+  for(size_t i = 0; i < current->len; i++){
+    if(current->buf[i] != previous->buf[i]){
+      diffCount++;
+      if(diffCount > changeThreshold) return true;
+    }
+  }
+  return false;
+}
+
+camera_fb_t* cloneFrame(camera_fb_t* source) {
+  if (!source) return nullptr;
+
+  camera_fb_t* clone = (camera_fb_t*) malloc(sizeof(camera_fb_t));
+  if (!clone) return nullptr;
+
+  clone->buf = (uint8_t*) malloc(source->len);
+  if (!clone->buf) {
+    free(clone);
+    return nullptr;
+  }
+
+  memcpy(clone->buf, source->buf, source->len);
+  clone->len = source->len;
+  clone->width = source->width;
+  clone->height = source->height;
+  clone->format = source->format;
+
+  return clone;
+}
+
+// Will be used to upload the captured camera frame to backend.
+bool uploadFrame(){
+  return true;
+}
+
+
