@@ -94,6 +94,19 @@ void loop(){
     }
     lastFrameCapture = currentMillis;
   }
+
+  static unsigned long lastAudio = 0;
+  if(millis() - lastAudio >= 10000){
+    uint8_t* audioBuffer = nullptr;
+    size_t audioLength = 0;
+
+    if(recordAudio(audioBuffer, audioLength)){
+      // uploadAudio(audioBuffer, audioLength);    Placeholder for audio uploading to backend.
+      free(audioBuffer);
+    }
+
+    lastAudio = millis();
+  }
 }
 
 void connectToWifi(){
@@ -258,6 +271,34 @@ bool setupMicrophone(){
   return true;
 }
 
-bool recordAudio(uint8_t*& buffer, size_t& length);
+bool recordAudio(uint8_t*& buffer, size_t& length){
+  const int sample_rate = 16000;
+  const int duration_sec = 1;
+  const int bytes_per_sample = 2;
+  length = sample_rate * duration_sec * bytes_per_sample;
+
+  buffer = (uint8_t*) malloc(length);
+
+  if(!buffer){
+    Serial.println("[Mic] Failed to allocate audio buffer");
+    return false;
+  }
+
+  size_t bytesRead = 0;
+  esp_err_t result = i2s_read(I2S_PORT, buffer, length, &bytesRead, portMAX_DELAY);
+
+
+
+  if(result != ESP_OK || bytesRead != length){
+    Serial.printf("Failed to read audio | Got %u / %u bytes \n", (unsigned int) bytesRead, (unsigned int) length);
+    free(buffer);
+    buffer = nullptr;
+    return false;
+  }
+
+  Serial.printf("[Mic] Recorded %.1fs | %u samples | %u  bytes\n", (float) duration_sec, (unsigned int) (length/2), (unsigned int) length);
+  return true;  
+}
+
 
 
