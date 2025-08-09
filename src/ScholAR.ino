@@ -68,6 +68,10 @@ volatile bool wsConnected = false;
 volatile bool audioReady = false;
 volatile bool isRecording = false;
 volatile unsigned long recordingStartTime = 0;
+volatile bool imageUploaded = false;  // Track if image has been uploaded
+volatile bool audioSessionComplete = false;  // Track if audio session is complete
+volatile unsigned long sleepStartTime = 0;  // Track sleep period start
+volatile bool inSleepMode = false;  // Track if in sleep mode
 
 #if USE_IDF5_NEW_I2S
   static i2s_chan_handle_t rx_handle = NULL;
@@ -137,13 +141,13 @@ void setup() {
   configureI2S_PDM_RX();
   Serial.println("[Audio] PDM microphone initialized!");
   
-  // Initialize WebSocket for audio streaming
-  Serial.println("[WebSocket] Configuring audio WebSocket...");
-  ws.begin(SERVER_HOST, SERVER_PORT, WS_PATH);
-  ws.onEvent(wsEvent);
-  ws.setReconnectInterval(3000);
-  ws.enableHeartbeat(15000, 3000, 2);
-  Serial.printf("[WebSocket] Connecting to ws://%s:%u%s\n", SERVER_HOST, SERVER_PORT, WS_PATH);
+  // WebSocket will be initialized after first image upload
+  Serial.println("\n[System] === ScholAR Operation Cycle ===");
+  Serial.println("[System] 1. Capture and upload image");
+  Serial.println("[System] 2. Stream audio for 10 seconds");
+  Serial.println("[System] 3. Sleep for 1 minute");
+  Serial.println("[System] 4. Repeat cycle");
+  Serial.println("[System] ========================\n");
 }
 
 // Initialize Camera for OCR
@@ -279,6 +283,16 @@ bool uploadImageMultipart(camera_fb_t *fb) {
   return ok;
 }
 
+// Initialize WebSocket Connection
+void initializeWebSocket() {
+  Serial.println("[WebSocket] Initializing audio WebSocket...");
+  ws.begin(SERVER_HOST, SERVER_PORT, WS_PATH);
+  ws.onEvent(wsEvent);
+  ws.setReconnectInterval(3000);
+  ws.enableHeartbeat(15000, 3000, 2);
+  Serial.printf("[WebSocket] Connecting to ws://%s:%u%s\n", SERVER_HOST, SERVER_PORT, WS_PATH);
+}
+
 // WebSocket Event Handler
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
   if (type == WStype_CONNECTED) {
@@ -410,9 +424,6 @@ void configureI2S_PDM_RX() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // Handle WebSocket
-  ws.loop();
-  
   // Handle LED blinking for status indication
   if (currentMillis - lastBlink >= blinkInterval) {
     ledState = !ledState;
@@ -420,8 +431,65 @@ void loop() {
     lastBlink = currentMillis;
   }
   
-  // Handle Audio Streaming
-  if (wsConnected && audioReady) {
+  // Handle Sleep Mode (1 minute after audio session)
+  if (inSleepMode) {
+    unsigned long sleepElapsed = currentMillis - sleepStartTime;
+    static unsigned long lastSleepReport = 0;
+    
+    // Report sleep progress every 10 seconds
+    if (currentMillis - lastSleepReport >= 10000) {
+      unsigned long remainingSeconds = (60000 - sleepElapsed) / 1000;
+      Serial.printf("[Sleep] %lu seconds remaining...\n", remainingSeconds);
+      lastSleepReport = currentMillis;
+    }
+    
+    // Check if sleep period is over (1 minute)
+    if (sleepElapsed >= 60000) {
+      Serial.println("[System] Sleep period ended. Starting new cycle...");
+      inSleepMode = false;
+      imageUploaded = false;
+      audioSessionComplete = false;
+      blinkInterval = 300; // Fast blink for activity
+    }
+    return; // Don't do anything else during sleep
+  }
+  
+  // Step 1: Upload image (at start and after each cycle)
+  if (wifiConnected && !imageUploaded && !audioSessionComplete) {
+    Serial.println("\n[System] Step 1: Capturing and uploading initial image...");
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("[Camera] Failed to capture image");
+      delay(1000); // Retry after 1 second
+      return;
+    } else {
+      Serial.printf("[Camera] Captured %dx%d, %u bytes\n", fb->width, fb->height, fb->len);
+      
+      // Upload the image
+      if (uploadImageMultipart(fb)) {
+        Serial.println("[Camera] Image uploaded successfully!");
+        imageUploaded = true;
+        
+        // Step 2: Initialize WebSocket after successful image upload
+        Serial.println("\n[System] Step 2: Starting audio WebSocket connection...");
+        initializeWebSocket();
+      } else {
+        Serial.println("[Camera] Image upload failed, retrying...");
+      }
+      
+      // Release the frame buffer
+      esp_camera_fb_return(fb);
+    }
+    return; // Don't proceed until image is uploaded
+  }
+  
+  // Handle WebSocket only after image has been uploaded
+  if (imageUploaded) {
+    ws.loop();
+  }
+  
+  // Step 3: Handle Audio Streaming (only after image upload and WebSocket connection)
+  if (imageUploaded && wsConnected && audioReady) {
     size_t totalRead = 0;
     while (totalRead < CHUNK_BYTES) {
       size_t justRead = 0;
@@ -451,8 +519,23 @@ void loop() {
       // Check if recording session should end
       if (isRecording && (millis() - recordingStartTime >= RECORDING_DURATION_MS)) {
         isRecording = false;
+        audioSessionComplete = true;
         Serial.println("[Audio] Recording session completed (10 seconds).");
-        blinkInterval = 1000; // Back to slow blink
+        Serial.println("\n[System] === Cycle Complete ===");
+        Serial.println("[System] ✓ Image captured and uploaded");
+        Serial.println("[System] ✓ 10-second audio recorded and streamed");
+        Serial.println("[System] Starting 1-minute sleep period...");
+        Serial.println("[System] Next cycle will begin automatically.\n");
+        
+        // Disconnect WebSocket to prepare for next cycle
+        ws.disconnect();
+        wsConnected = false;
+        audioReady = false;
+        
+        // Start sleep period
+        sleepStartTime = millis();
+        inSleepMode = true;
+        blinkInterval = 2000; // Very slow blink during sleep
       }
 
       if (isRecording) {
@@ -472,30 +555,6 @@ void loop() {
         // Send audio data
         ws.sendBIN(audioBuf, CHUNK_BYTES);
       }
-    }
-  }
-  
-  // Handle Image Capture (reduced frequency during audio recording)
-  static unsigned long lastCapture = 0;
-  if (wifiConnected && !isRecording && currentMillis - lastCapture >= 10000) {
-    lastCapture = currentMillis;
-    
-    Serial.println("\n[Camera] Capturing image...");
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("[Camera] Failed to capture image");
-    } else {
-      Serial.printf("[Camera] Captured %dx%d, %u bytes\n", fb->width, fb->height, fb->len);
-      
-      // Upload the image
-      if (uploadImageMultipart(fb)) {
-        Serial.println("[Camera] Image uploaded successfully!");
-      } else {
-        Serial.println("[Camera] Image upload failed");
-      }
-      
-      // Release the frame buffer
-      esp_camera_fb_return(fb);
     }
   }
 }
