@@ -1,205 +1,294 @@
 /*
-  test_mic_websocket_pdm_driver_only.ino
-  - NO <I2S.h> wrapper — uses ESP-IDF I2S drivers only
-  - Supports IDF 5.x (new PDM API) and legacy API
-  - Streams 16 kHz / 16-bit mono PCM (20 ms = 640B) over WebSocket
-
-  Wi-Fi   : SSID=testing  PASS=jenish1235
-  WebSock : ws://10.217.177.125:8000/stream/audio
+  XIAO ESP32S3 Sense PDM Microphone - Clean Implementation
+  
+  This implementation focuses on getting the PDM microphone working correctly
+  with proper configuration and minimal complexity.
+  
+  Hardware: Seeed Studio XIAO ESP32S3 Sense
+  Microphone: Built-in PDM microphone (MSM261S4030H0)
+  Pins: CLK=42, DATA=41
 */
 
 #include <WiFi.h>
 #include <WebSocketsClient.h>
-#include <esp_idf_version.h>
+#include <driver/i2s.h>
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5,0,0)
-  #define USE_IDF5_NEW_I2S 1
-  #include "driver/i2s_common.h"
-  #include "driver/i2s_pdm.h"
-#else
-  #define USE_IDF5_NEW_I2S 0
-  #include "driver/i2s.h"
-#endif
+// WiFi Configuration
+const char* ssid = "Vedan_Guest";
+const char* password = "Vedantu@2025";
 
-// ---------- Wi-Fi ----------
-static const char* WIFI_SSID = "testing";
-static const char* WIFI_PASS = "jenish1235";
+// WebSocket Configuration  
+const char* websocket_host = "10.10.30.172";
+const int websocket_port = 8000;
+const char* websocket_path = "/stream/audio";
 
-// ---------- WebSocket ----------
-static const char* SERVER_HOST = "10.217.177.125";
-static const uint16_t SERVER_PORT = 8000;
-static const char* SERVER_PATH = "/stream/audio";
+// Audio Configuration
+#define SAMPLE_RATE 16000
+#define BITS_PER_SAMPLE 16
+#define CHANNEL_COUNT 1
+#define BYTES_PER_SAMPLE (BITS_PER_SAMPLE / 8)
 
-// ---------- Audio ----------
-#define SAMPLE_RATE     16000
-#define CHUNK_MS        20
-#define CHUNK_SAMPLES   ((SAMPLE_RATE * CHUNK_MS) / 1000)  // 320
-#define CHUNK_BYTES     (CHUNK_SAMPLES * 2)                // 640 (s16le)
-#define VOLUME_SHIFT    0  // optional 0..3
+// Chunk configuration (send audio in chunks)
+#define CHUNK_DURATION_MS 100  // 100ms chunks
+#define SAMPLES_PER_CHUNK (SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
+#define BYTES_PER_CHUNK (SAMPLES_PER_CHUNK * BYTES_PER_SAMPLE * CHANNEL_COUNT)
 
-// XIAO ESP32S3 Sense PDM mic pins (CLK=42, DATA=41)
-#define PDM_CLK_PIN     42
-#define PDM_DATA_PIN    41
+// I2S Configuration for PDM
+#define I2S_PORT I2S_NUM_0
+#define PDM_CLK_PIN 42
+#define PDM_DATA_PIN 41
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
+// DMA Buffer Configuration
+#define DMA_BUF_COUNT 4
+#define DMA_BUF_LEN 1024
 
-WebSocketsClient ws;
-volatile bool wsConnected = false;
+// Global Variables
+WebSocketsClient webSocket;
+bool isConnected = false;
+int16_t* audioBuffer = nullptr;
 
-#if USE_IDF5_NEW_I2S
-  static i2s_chan_handle_t rx_handle = NULL;
-#else
-  static const i2s_port_t I2S_PORT = I2S_NUM_0;
-#endif
-
-static uint8_t* audioBuf = nullptr;
-
-// ---------- Helpers ----------
-void connectWiFi() {
-  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
-  Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
-}
-
-void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_CONNECTED) {
-    wsConnected = true;
-    Serial.printf("[WS] Connected: ws://%s:%u%s\n", SERVER_HOST, SERVER_PORT, SERVER_PATH);
-    // ws.se   ndTXT(String("{\"type\":\"meta\",\"codec\":\"pcm_s16le\",\"sample_rate\":") +
-    //            SAMPLE_RATE + ",\"channels\":1,\"chunk_ms\":" + CHUNK_MS + "}");
-  } else if (type == WStype_DISCONNECTED) {
-    wsConnected = false;
-    Serial.println("[WS] Disconnected");
-  } else if (type == WStype_TEXT) {
-    Serial.printf("[WS] %.*s\n", (int)length, (char*)payload);
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("=== XIAO ESP32S3 PDM Microphone Test ===");
+  
+  // Initialize LED
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  
+  // Allocate audio buffer
+  audioBuffer = (int16_t*)malloc(BYTES_PER_CHUNK);
+  if (!audioBuffer) {
+    Serial.println("ERROR: Failed to allocate audio buffer!");
+    while(1) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(200);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(200);
+    }
   }
+  
+  // Connect to WiFi
+  setupWiFi();
+  
+  // Initialize I2S for PDM microphone
+  if (setupI2S()) {
+    Serial.println("I2S PDM setup successful");
+  } else {
+    Serial.println("ERROR: I2S PDM setup failed!");
+    while(1) delay(1000);
+  }
+  
+  // Setup WebSocket
+  setupWebSocket();
+  
+  Serial.println("Setup complete - starting audio capture...");
 }
 
-void configureWebSocket() {
-  ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
-  ws.onEvent(wsEvent);
-  ws.setReconnectInterval(3000);
-  ws.enableHeartbeat(15000, 3000, 2);
-  Serial.printf("[WS] Connecting to ws://%s:%u%s ...\n", SERVER_HOST, SERVER_PORT, SERVER_PATH);
+void setupWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.print("WiFi connected! IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-#if USE_IDF5_NEW_I2S
-// ---------- IDF 5.x (new PDM API) ----------
-void configureI2S_PDM_RX_IDF5() {
-  // Create RX channel
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
-
-  // Default clock: sets sample rate etc.
-  i2s_pdm_rx_clk_config_t clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-
-  // **IMPORTANT**: slot config needs TWO args (bits, mono/stereo)
-  i2s_pdm_rx_slot_config_t slot_cfg =
-      I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
-
-  // GPIO config
-  i2s_pdm_rx_gpio_config_t gpio_cfg = {
-    .clk = (gpio_num_t)PDM_CLK_PIN,
-    .din = (gpio_num_t)PDM_DATA_PIN,
-    .invert_flags = { .clk_inv = false },
-  };
-
-  i2s_pdm_rx_config_t pdm_cfg = {
-    .clk_cfg  = clk_cfg,
-    .slot_cfg = slot_cfg,
-    .gpio_cfg = gpio_cfg,
-  };
-
-  ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(rx_handle, &pdm_cfg));
-  ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
-  Serial.println("[I2S][IDF5] PDM RX enabled @16k/16-bit MONO");
-}
-#else
-// ---------- Legacy I2S API ----------
-void configureI2S_PDM_RX_Legacy() {
-  // uninstall may log a warning if not previously installed; that's fine
-  i2s_driver_uninstall(I2S_PORT);
-
+bool setupI2S() {
+  Serial.println("Configuring I2S for PDM microphone...");
+  
+  // I2S configuration for PDM microphone - ESP32S3 specific
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 256,
+    .dma_buf_count = DMA_BUF_COUNT,
+    .dma_buf_len = DMA_BUF_LEN,
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
-
-  i2s_pin_config_t pin_cfg = {
-    .bck_io_num   = I2S_PIN_NO_CHANGE, // PDM RX doesn't use BCK
-    .ws_io_num    = PDM_CLK_PIN,       // PDM clock
+  
+  // Install I2S driver first
+  esp_err_t result = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (result != ESP_OK) {
+    Serial.print("ERROR: I2S driver install failed: ");
+    Serial.println(esp_err_to_name(result));
+    return false;
+  }
+  
+  // Pin configuration for PDM
+  i2s_pin_config_t pin_config = {
+    .mck_io_num = I2S_PIN_NO_CHANGE,
+    .bck_io_num = I2S_PIN_NO_CHANGE,
+    .ws_io_num = PDM_CLK_PIN,      // PDM Clock
     .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num  = PDM_DATA_PIN
+    .data_in_num = PDM_DATA_PIN    // PDM Data
   };
-
-  ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL));
-  ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pin_cfg));
-  // This call prevents the pdm2pcm assert
-  ESP_ERROR_CHECK(i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO));
-
-  Serial.println("[I2S][LEGACY] PDM RX enabled @16k/16-bit MONO");
+  
+  // Set pins
+  result = i2s_set_pin(I2S_PORT, &pin_config);
+  if (result != ESP_OK) {
+    Serial.print("ERROR: I2S pin config failed: ");
+    Serial.println(esp_err_to_name(result));
+    i2s_driver_uninstall(I2S_PORT);
+    return false;
+  }
+  
+  // CRITICAL: Configure PDM for ESP32S3
+  result = i2s_set_pdm_rx_down_sample(I2S_PORT, I2S_PDM_DSR_8S);
+  if (result != ESP_OK) {
+    Serial.print("ERROR: PDM down sample config failed: ");
+    Serial.println(esp_err_to_name(result));
+    i2s_driver_uninstall(I2S_PORT);
+    return false;
+  }
+  
+  // Set clock last
+  result = i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  if (result != ESP_OK) {
+    Serial.print("ERROR: I2S clock config failed: ");
+    Serial.println(esp_err_to_name(result));
+    i2s_driver_uninstall(I2S_PORT);
+    return false;
+  }
+  
+  // Start I2S
+  result = i2s_start(I2S_PORT);
+  if (result != ESP_OK) {
+    Serial.print("ERROR: I2S start failed: ");
+    Serial.println(esp_err_to_name(result));
+    i2s_driver_uninstall(I2S_PORT);
+    return false;
+  }
+  
+  Serial.printf("I2S PDM configured successfully: %d Hz, %d-bit, mono\n", SAMPLE_RATE, BITS_PER_SAMPLE);
+  
+  // Clear any initial data in the buffer
+  size_t bytes_read;
+  uint8_t dummy_buffer[1024];
+  i2s_read(I2S_PORT, dummy_buffer, sizeof(dummy_buffer), &bytes_read, 0);
+  
+  return true;
 }
-#endif
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+void setupWebSocket() {
+  webSocket.begin(websocket_host, websocket_port, websocket_path);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+  
+  Serial.printf("WebSocket connecting to ws://%s:%d%s\n", 
+                websocket_host, websocket_port, websocket_path);
+}
 
-  connectWiFi();
-  configureWebSocket();
-
-  audioBuf = (uint8_t*) ps_malloc(CHUNK_BYTES);
-  if (!audioBuf) audioBuf = (uint8_t*) malloc(CHUNK_BYTES);
-  if (!audioBuf) { Serial.println("[Mem] buffer alloc failed"); while (1) delay(1000); }
-
-#if USE_IDF5_NEW_I2S
-  configureI2S_PDM_RX_IDF5();
-#else
-  configureI2S_PDM_RX_Legacy();
-#endif
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected");
+      isConnected = false;
+      digitalWrite(LED_BUILTIN, LOW);
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Connected to: %s\n", payload);
+      isConnected = true;
+      break;
+      
+    case WStype_TEXT:
+      Serial.printf("[WS] Received text: %s\n", payload);
+      break;
+      
+    case WStype_BIN:
+      Serial.printf("[WS] Received binary data: %u bytes\n", length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.println("[WS] Error occurred");
+      isConnected = false;
+      break;
+      
+    default:
+      break;
+  }
 }
 
 void loop() {
-  ws.loop();
-
-  size_t totalRead = 0;
-  while (totalRead < CHUNK_BYTES) {
-    size_t justRead = 0;
-#if USE_IDF5_NEW_I2S
-    esp_err_t res = i2s_channel_read(rx_handle, audioBuf + totalRead,
-                                     CHUNK_BYTES - totalRead, &justRead, portMAX_DELAY);
-#else
-    esp_err_t res = i2s_read(I2S_PORT, audioBuf + totalRead,
-                             CHUNK_BYTES - totalRead, &justRead, portMAX_DELAY);
-#endif
-    if (res != ESP_OK) { Serial.printf("[I2S] read error: 0x%x\n", res); break; }
-    totalRead += justRead;
+  // Handle WebSocket
+  webSocket.loop();
+  
+  // Capture and send audio if connected
+  if (isConnected) {
+    captureAndSendAudio();
+  } else {
+    delay(100);  // Wait if not connected
   }
+}
 
-  if (totalRead == CHUNK_BYTES && wsConnected) {
-    if (VOLUME_SHIFT > 0) {
-      int16_t* s = (int16_t*) audioBuf;
-      for (size_t i = 0; i < CHUNK_SAMPLES; ++i) {
-        int32_t v = (int32_t)s[i] << VOLUME_SHIFT;
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        s[i] = (int16_t)v;
-      }
+void captureAndSendAudio() {
+  size_t bytesRead = 0;
+  size_t totalBytesRead = 0;
+  
+  // Read audio data from I2S
+  while (totalBytesRead < BYTES_PER_CHUNK) {
+    esp_err_t result = i2s_read(I2S_PORT, 
+                               (uint8_t*)audioBuffer + totalBytesRead,
+                               BYTES_PER_CHUNK - totalBytesRead,
+                               &bytesRead,
+                               pdMS_TO_TICKS(1000));  // 1 second timeout
+    
+    if (result != ESP_OK) {
+      Serial.printf("I2S read error: %s\n", esp_err_to_name(result));
+      return;
     }
-    ws.sendBIN(audioBuf, CHUNK_BYTES);
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // blink while streaming
+    
+    totalBytesRead += bytesRead;
+  }
+  
+  // Apply basic audio processing
+  processAudio(audioBuffer, SAMPLES_PER_CHUNK);
+  
+  // Send via WebSocket
+  webSocket.sendBIN((uint8_t*)audioBuffer, BYTES_PER_CHUNK);
+  
+  // Blink LED to show activity
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 200) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    lastBlink = millis();
+  }
+}
+
+void processAudio(int16_t* buffer, size_t samples) {
+  // Apply basic DC removal and gain
+  static int32_t dcSum = 0;
+  
+  // Calculate DC offset
+  int64_t sum = 0;
+  for (size_t i = 0; i < samples; i++) {
+    sum += buffer[i];
+  }
+  dcSum = sum / samples;
+  
+  // Remove DC offset and apply gain
+  for (size_t i = 0; i < samples; i++) {
+    // Remove DC offset
+    int32_t sample = buffer[i] - dcSum;
+    
+    // Apply 2x gain with clipping
+    sample *= 2;
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    
+    buffer[i] = (int16_t)sample;
   }
 }

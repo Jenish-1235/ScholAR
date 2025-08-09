@@ -1,148 +1,227 @@
 /*
-  test_camera_upload.ino
-  Purpose: Capture an image and POST it to FastAPI server.
-  SSID: testing
-  Password: jenish1235
+  test_camera_upload_ocr_single.ino
+  One good-quality capture (OCR tuned) → multipart/form-data upload.
+
+  Wi-Fi: SSID=testing, PASS=jenish1235
+  Server: http://10.217.177.125:8000/upload/image
+  Field name: "file"
 */
 
+#define CAMERA_MODEL_XIAO_ESP32S3
 #include <WiFi.h>
-#include <esp_camera.h>
-#include <HTTPClient.h>
+#include <WiFiClient.h>
+#include "esp_camera.h"
+#include "camera_pins.h"
 
-// ==== Wi-Fi credentials ====
-const char *ssid = "testing";
-const char *password = "jenish1235";
+// ===== Wi-Fi =====
+static const char *WIFI_SSID = "Vedan_Guest";
+static const char *WIFI_PASS = "Vedantu@2025";
 
-// ==== FastAPI server (replace with your PC's LAN IP) ====
-const char *serverUrl = "http://10.217.177.125:8000/upload/image";
+// ===== Server =====
+static const char *SERVER_HOST = "10.10.30.172";
+static const uint16_t SERVER_PORT = 8000;
+static const char *SERVER_PATH = "/upload/image"; // matches your FastAPI router
 
-// ==== Camera pin mapping for Seeed XIAO ESP32-S3 ====
-#define PWDN_GPIO_NUM -1
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 10
-#define SIOD_GPIO_NUM 40
-#define SIOC_GPIO_NUM 39
+// ===== Tuning knobs =====
+static const int AE_LEVEL = 1;    // -2..+2; bump exposure a touch
+static const int WB_MODE = 2;     // 0=auto; try 2 (fluorescent) if green cast
+static const int JPEG_Q_UXGA = 8; // lower number = higher quality (8–12 good)
+static const int JPEG_Q_SVGA = 10;
 
-#define Y9_GPIO_NUM 48
-#define Y8_GPIO_NUM 11
-#define Y7_GPIO_NUM 12
-#define Y6_GPIO_NUM 14
-#define Y5_GPIO_NUM 16
-#define Y4_GPIO_NUM 18
-#define Y3_GPIO_NUM 17
-#define Y2_GPIO_NUM 15
-
-#define VSYNC_GPIO_NUM 38
-#define HREF_GPIO_NUM 47
-#define PCLK_GPIO_NUM 13
-
-void connectToWiFi()
+// --------- Wi-Fi ----------
+void connectWiFi()
 {
-    Serial.printf("Connecting to %s", ssid);
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-bool initCamera()
+// --------- Camera init (OCR tuned) ----------
+bool initCameraForOCR()
 {
-    camera_config_t config;
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer = LEDC_TIMER_0;
-    config.pin_d0 = Y2_GPIO_NUM;
-    config.pin_d1 = Y3_GPIO_NUM;
-    config.pin_d2 = Y4_GPIO_NUM;
-    config.pin_d3 = Y5_GPIO_NUM;
-    config.pin_d4 = Y6_GPIO_NUM;
-    config.pin_d5 = Y7_GPIO_NUM;
-    config.pin_d6 = Y8_GPIO_NUM;
-    config.pin_d7 = Y9_GPIO_NUM;
-    config.pin_xclk = XCLK_GPIO_NUM;
-    config.pin_pclk = PCLK_GPIO_NUM;
-    config.pin_vsync = VSYNC_GPIO_NUM;
-    config.pin_href = HREF_GPIO_NUM;
-    config.pin_sscb_sda = SIOD_GPIO_NUM;
-    config.pin_sscb_scl = SIOC_GPIO_NUM;
-    config.pin_pwdn = PWDN_GPIO_NUM;
-    config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG;
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
 
-    // QVGA for smaller upload size
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 15;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Prefer max detail if PSRAM is available; else solid fallback.
+  if (psramFound())
+  {
+    config.frame_size = FRAMESIZE_UXGA; // 1600x1200
+    config.jpeg_quality = JPEG_Q_UXGA;  // 8–12
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  }
+  else
+  {
+    config.frame_size = FRAMESIZE_SVGA; // 800x600
+    config.jpeg_quality = JPEG_Q_SVGA;
     config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
-    if (esp_camera_init(&config) != ESP_OK)
-    {
-        Serial.println("Camera init failed!");
-        return false;
-    }
-    Serial.println("Camera init success.");
-    return true;
+  esp_camera_deinit(); // clean slate just in case
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK)
+  {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+
+  // --- Sensor tuning for OCR ---
+  sensor_t *s = esp_camera_sensor_get();
+
+  // Auto exposure/gain
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
+  s->set_ae_level(s, AE_LEVEL);
+  s->set_gain_ctrl(s, 1);
+  s->set_gainceiling(s, GAINCEILING_32X);
+
+  // White balance
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, WB_MODE); // 0 auto; 2 fluorescent if green cast
+
+  // Cleanups / sharpening helpers
+  s->set_lenc(s, 1); // lens correction
+  s->set_bpc(s, 1);  // black pixel correction
+  s->set_wpc(s, 1);  // white pixel correction
+  s->set_raw_gma(s, 1);
+  s->set_dcw(s, 1); // better downsize quality
+  s->set_colorbar(s, 0);
+
+  // Make text pop a bit
+  s->set_brightness(s, 1);  // -2..2
+  s->set_contrast(s, 1);    // -2..2
+  s->set_saturation(s, -1); // -2..2 (slight desat helps OCR)
+
+  return true;
 }
 
-bool uploadImage(camera_fb_t *fb)
+// --------- Multipart upload (field "file") ----------
+bool uploadImageMultipart(camera_fb_t *fb)
 {
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.println("WiFi not connected.");
-        return false;
-    }
+  if (!fb)
+    return false;
 
-    HTTPClient http;
-    http.begin(serverUrl);
-    http.addHeader("Content-Type", "image/jpeg");
+  const char *boundary = "----ESP32Boundary7MA4YWxkTrZu0gW";
+  String preamble;
+  preamble += "--";
+  preamble += boundary;
+  preamble += "\r\n";
+  preamble += "Content-Disposition: form-data; name=\"file\"; filename=\"frame.jpg\"\r\n";
+  preamble += "Content-Type: image/jpeg\r\n\r\n";
+  String closing = "\r\n--";
+  closing += boundary;
+  closing += "--\r\n";
+  size_t contentLength = preamble.length() + fb->len + closing.length();
 
-    int httpResponseCode = http.POST(fb->buf, fb->len);
-    if (httpResponseCode > 0)
-    {
-        Serial.printf("Upload finished. Response code: %d\n", httpResponseCode);
-        Serial.println(http.getString());
-    }
-    else
-    {
-        Serial.printf("Upload failed. Error: %s\n", http.errorToString(httpResponseCode).c_str());
-    }
+  WiFiClient client;
+  Serial.printf("[HTTP] Connecting %s:%u\n", SERVER_HOST, SERVER_PORT);
+  if (!client.connect(SERVER_HOST, SERVER_PORT))
+  {
+    Serial.println("[HTTP] Connect failed");
+    return false;
+  }
 
-    http.end();
-    return (httpResponseCode == 200);
+  // Request + headers
+  client.printf("POST %s HTTP/1.1\r\n", SERVER_PATH);
+  client.printf("Host: %s\r\n", SERVER_HOST);
+  client.println("Connection: close");
+  client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
+  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
+  client.print("\r\n");
+
+  // Body streamed (no large temp buffer)
+  client.print(preamble);
+  client.write(fb->buf, fb->len);
+  client.print(closing);
+
+  // Read status
+  String status = client.readStringUntil('\n');
+  Serial.print(status);
+  bool ok = status.startsWith("HTTP/1.1 200");
+
+  // Optional: drain remaining response
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 3000)
+  {
+    while (client.available())
+    {
+      String line = client.readStringUntil('\n');
+      Serial.print(line);
+      t0 = millis();
+    }
+  }
+  client.stop();
+  Serial.printf("[HTTP] Upload %s\n", ok ? "OK" : "FAILED");
+  return ok;
 }
 
 void setup()
 {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.begin(115200);
+  delay(300);
 
-    connectToWiFi();
-    if (!initCamera())
-    {
-        while (true)
-            delay(1000);
-    }
+  connectWiFi();
+  if (!initCameraForOCR())
+  {
+    Serial.println("Camera init failed, halting.");
+    while (true)
+      delay(1000);
+  }
 
-    // Capture a frame
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb)
-    {
-        Serial.println("Failed to capture image.");
-        return;
-    }
-    Serial.printf("Captured %dx%d image, %u bytes\n", fb->width, fb->height, fb->len);
+  // Warm-up frames to let AEC/AWB settle
+  for (int i = 0; i < 2; ++i)
+  {
+    camera_fb_t *warm = esp_camera_fb_get();
+    if (warm)
+      esp_camera_fb_return(warm);
+    delay(120);
+  }
 
-    // Upload it
-    uploadImage(fb);
+  // Capture one good frame
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb)
+  {
+    Serial.println("Failed to capture image.");
+    return;
+  }
+  Serial.printf("Captured %dx%d, %u bytes\n", fb->width, fb->height, fb->len);
 
-    esp_camera_fb_return(fb);
+  // Upload it
+  uploadImageMultipart(fb);
+
+  // Release buffer
+  esp_camera_fb_return(fb);
 }
 
 void loop()
 {
-    // Nothing in loop — one-time test
+  // One-shot test; nothing to do.
 }
