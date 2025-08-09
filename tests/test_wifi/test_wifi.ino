@@ -7,8 +7,8 @@
 
 #include <WiFi.h>
 
-const char *ssid = "testing";
-const char *password = "jenish1235";
+const char *ssid = "Vedan_Guest";
+const char *password = "Vedantu@2025";
 
 const int LED_PIN = LED_BUILTIN; // Change if your board uses a different LED pin
 
